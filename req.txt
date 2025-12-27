@@ -1,0 +1,32 @@
+streamlit
+python-dotenv
+
+# LangChain core & integrations
+langchain
+langchain-core
+langchain-community
+langchain-chroma
+langchain-groq
+langchain-huggingface
+langchain-text-splitters
+
+# Vector DB
+chromadb
+
+# Embeddings
+sentence-transformers
+huggingface-hub
+
+# PDF loading
+pypdf
+
+# Utilities
+tiktoken
+
+#fast api
+fastapi
+uvicorn
+python-multipart
+pydantic
+
+beautifulsoup4
