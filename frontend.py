@@ -4,7 +4,7 @@ from typing import List
 import os
 
 # Backend API URL - works for both local and production
-API_URL = os.getenv("BACKEND_URL", "https://rag-backend-tusk.onrender.com")
+API_URL = os.getenv("BACKEND_URL", "https://multi-rag-app.onrender.com")
 
 # Page config
 st.set_page_config(
