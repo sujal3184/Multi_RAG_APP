@@ -4,8 +4,8 @@ from pydantic import BaseModel
 from typing import List, Optional
 import os
 from dotenv import load_dotenv
-from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_chroma import Chroma
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
@@ -21,21 +21,29 @@ import shutil
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="RAG API", version="1.0.0")
 
-# CORS middleware
+# CORS middleware - Updated to work with Streamlit Cloud
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins (will work with any Streamlit app)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Global storage
 session_stores = {}
 vectorstores = {}
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+embeddings = None
+
+def get_embeddings():
+    """Lazy load embeddings to avoid startup delays"""
+    global embeddings
+    if embeddings is None:
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return embeddings
 
 class QueryRequest(BaseModel):
     question: str
@@ -76,15 +84,13 @@ def add_documents_to_vectorstore(session_id: str, documents: List[Document]):
             detail="All document chunks are empty."
         )
     
-    # Create or update vectorstore
+    # Create or update vectorstore (in-memory for Render)
     if session_id in vectorstores:
-        # Add to existing vectorstore
         vectorstores[session_id].add_documents(splits)
     else:
-        # Create new vectorstore
         vectorstore = Chroma.from_documents(
             documents=splits, 
-            embedding=embeddings,
+            embedding=get_embeddings(),
             collection_name=f"collection_{session_id}"
         )
         vectorstores[session_id] = vectorstore
@@ -97,18 +103,14 @@ def extract_citations(source_documents: List[Document]) -> List[dict]:
     seen = set()
     
     for doc in source_documents:
-        # Get source information
         source = doc.metadata.get('source', 'Unknown')
         page = doc.metadata.get('page')
         
-        # Create unique identifier
         citation_id = f"{source}_{page}" if page is not None else source
         
-        # Avoid duplicate citations
         if citation_id not in seen:
             seen.add(citation_id)
             
-            # Extract file name from path for PDFs
             if source.endswith('.pdf') or '/' in source or '\\' in source:
                 source_name = os.path.basename(source)
             else:
@@ -123,6 +125,32 @@ def extract_citations(source_documents: List[Document]) -> List[dict]:
     
     return citations
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "RAG API is running",
+        "status": "healthy",
+        "endpoints": {
+            "health": "/health",
+            "upload_pdfs": "/upload-pdfs",
+            "upload_urls": "/upload-urls",
+            "query": "/query",
+            "chat_history": "/chat-history/{session_id}",
+            "clear_session": "/session/{session_id}"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "RAG API",
+        "active_sessions": len(session_stores),
+        "active_vectorstores": len(vectorstores)
+    }
+
 @app.post("/upload-pdfs")
 async def upload_pdfs(
     files: List[UploadFile] = File(...),
@@ -136,32 +164,25 @@ async def upload_pdfs(
             if not file.filename.endswith('.pdf'):
                 raise HTTPException(status_code=400, detail="Only PDF files are allowed")
             
-            # Create temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
                 shutil.copyfileobj(file.file, tmp_file)
                 tmp_path = tmp_file.name
             
-            # Load PDF
             loader = PyPDFLoader(tmp_path)
             docs = loader.load()
             
-            # Add filename to metadata
             for doc in docs:
                 doc.metadata['source'] = file.filename
             
             documents.extend(docs)
-            
-            # Clean up
             os.unlink(tmp_path)
         
-        # Check if documents were loaded
         if not documents:
             raise HTTPException(
                 status_code=400, 
                 detail="No content extracted from PDFs. Please check if PDFs contain text."
             )
         
-        # Add documents to vectorstore
         chunks = add_documents_to_vectorstore(session_id, documents)
         
         return {
@@ -189,12 +210,10 @@ async def upload_urls(request: URLRequest):
         
         for url in request.urls:
             try:
-                # Load web content
                 loader = WebBaseLoader(url)
                 docs = loader.load()
                 
                 if docs and docs[0].page_content.strip():
-                    # Ensure URL is in metadata
                     for doc in docs:
                         doc.metadata['source'] = url
                     documents.extend(docs)
@@ -211,7 +230,6 @@ async def upload_urls(request: URLRequest):
                 detail=f"No content extracted from any URLs. Failed: {failed_urls}"
             )
         
-        # Add documents to vectorstore
         chunks = add_documents_to_vectorstore(request.session_id, documents)
         
         response = {
@@ -243,15 +261,12 @@ async def query_documents(request: QueryRequest):
                 detail="No documents uploaded for this session. Please upload PDFs or URLs first."
             )
         
-        # Initialize LLM
         llm = ChatGroq(groq_api_key=request.groq_api_key, model_name="llama-3.3-70b-versatile")
         
-        # Get retriever with more results for better citations
         retriever = vectorstores[session_id].as_retriever(
-            search_kwargs={"k": 4}  # Retrieve top 4 relevant chunks
+            search_kwargs={"k": 4}
         )
         
-        # Contextualize question prompt
         contextualize_q_system_prompt = (
             "Given a chat history and the latest user question "
             "which might reference context in the chat history, "
@@ -269,7 +284,6 @@ async def query_documents(request: QueryRequest):
             llm, retriever, contextualize_q_prompt
         )
         
-        # Answer prompt
         system_prompt = (
             "You are an assistant for question-answering tasks. "
             "Use the following pieces of retrieved context to answer "
@@ -296,13 +310,11 @@ async def query_documents(request: QueryRequest):
             output_messages_key="answer"
         )
         
-        # Get response
         response = conversational_rag_chain.invoke(
             {"input": request.question},
             config={"configurable": {"session_id": session_id}}
         )
         
-        # Extract citations from context documents
         citations = extract_citations(response.get('context', []))
         
         return {
@@ -341,11 +353,6 @@ async def clear_session(session_id: str):
         return {"status": "success", "message": "Session cleared"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import uvicorn
