@@ -4,7 +4,7 @@ from typing import List
 import os
 
 # Backend API URL - works for both local and production
-API_URL = os.getenv("BACKEND_URL", "https://multi-rag-app.onrender.com")
+API_URL = os.getenv("BACKEND_URL", "https://sujal318-rag-fastapi-backend.hf.space/")
 
 # Page config
 st.set_page_config(
@@ -280,3 +280,4 @@ else:
 
 # Footer
 st.divider()
+
