@@ -10,6 +10,7 @@ langchain-groq
 langchain-huggingface
 langchain-text-splitters
 
+
 # Vector DB
 chromadb
 
@@ -28,5 +29,12 @@ fastapi
 uvicorn
 python-multipart
 pydantic
+uvicorn[standard]
 
 beautifulsoup4
+
+langchain-openai
+langchain-qdrant
+qdrant-client
+
+
