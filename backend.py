@@ -6,43 +6,72 @@ import os
 from dotenv import load_dotenv
 from langchain_classic.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_chroma import Chroma
+from langchain_qdrant import QdrantVectorStore
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings  # Changed import
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_core.documents import Document
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
 import tempfile
 import shutil
+from datetime import datetime, timedelta
 
 load_dotenv()
 
-app = FastAPI(title="RAG API", version="1.0.0")
+app = FastAPI(title="RAG API", version="2.0.0")
 
-# CORS middleware - Updated to work with Streamlit Cloud
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (will work with any Streamlit app)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
 )
 
-# Global storage
+# Global storage - only chat history in memory now
 session_stores = {}
-vectorstores = {}
+session_last_activity = {}
+
+# Initialize Qdrant client
+qdrant_client = None
 embeddings = None
 
+def get_qdrant_client():
+    """Initialize Qdrant client"""
+    global qdrant_client
+    if qdrant_client is None:
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+        
+        if not qdrant_url or not qdrant_api_key:
+            raise HTTPException(
+                status_code=500,
+                detail="QDRANT_URL and QDRANT_API_KEY must be set in environment variables"
+            )
+        
+        qdrant_client = QdrantClient(
+            url=qdrant_url,
+            api_key=qdrant_api_key,
+        )
+    return qdrant_client
+
 def get_embeddings():
-    """Lazy load embeddings to avoid startup delays"""
+    """Initialize HuggingFace embeddings (runs locally)"""
     global embeddings
     if embeddings is None:
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L12-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True, 'batch_size': 32}
+        )
     return embeddings
 
 class QueryRequest(BaseModel):
@@ -63,12 +92,33 @@ class Citation(BaseModel):
     content: str
 
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    """Get or create chat history for a session"""
     if session_id not in session_stores:
         session_stores[session_id] = ChatMessageHistory()
+    session_last_activity[session_id] = datetime.now()
     return session_stores[session_id]
 
+def get_collection_name(session_id: str) -> str:
+    """Generate collection name for session"""
+    # Qdrant collection names must start with letter and contain only letters, digits, hyphens, underscores
+    return f"session_{session_id.replace('-', '_')}"
+
+def ensure_collection_exists(session_id: str):
+    """Create Qdrant collection if it doesn't exist"""
+    client = get_qdrant_client()
+    collection_name = get_collection_name(session_id)
+    
+    collections = client.get_collections().collections
+    collection_names = [col.name for col in collections]
+    
+    if collection_name not in collection_names:
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)  # Changed to 384 for HuggingFace
+        )
+
 def add_documents_to_vectorstore(session_id: str, documents: List[Document]):
-    """Add documents to existing or new vectorstore"""
+    """Add documents to Qdrant vector store"""
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=5000, 
         chunk_overlap=500
@@ -84,18 +134,63 @@ def add_documents_to_vectorstore(session_id: str, documents: List[Document]):
             detail="All document chunks are empty."
         )
     
-    # Create or update vectorstore (in-memory for Render)
-    if session_id in vectorstores:
-        vectorstores[session_id].add_documents(splits)
-    else:
-        vectorstore = Chroma.from_documents(
-            documents=splits, 
-            embedding=get_embeddings(),
-            collection_name=f"collection_{session_id}"
-        )
-        vectorstores[session_id] = vectorstore
+    collection_name = get_collection_name(session_id)
+    
+    # Check if collection exists and delete if it has wrong dimensions
+    client = get_qdrant_client()
+    collections = client.get_collections().collections
+    collection_names = [col.name for col in collections]
+    
+    force_recreate = False
+    if collection_name in collection_names:
+        # Collection exists, check if we need to recreate
+        try:
+            collection_info = client.get_collection(collection_name)
+            vector_size = collection_info.config.params.vectors.size
+            if vector_size != 384:  # HuggingFace embedding size
+                print(f"Collection has wrong dimensions ({vector_size}), recreating...")
+                force_recreate = True
+        except:
+            force_recreate = True
+    
+    # Add documents to Qdrant
+    QdrantVectorStore.from_documents(
+        documents=splits,
+        embedding=get_embeddings(),
+        url=os.getenv("QDRANT_URL"),
+        api_key=os.getenv("QDRANT_API_KEY"),
+        collection_name=collection_name,
+        force_recreate=force_recreate
+    )
+    
+    session_last_activity[session_id] = datetime.now()
     
     return len(splits)
+
+def get_vectorstore(session_id: str) -> QdrantVectorStore:
+    """Get vector store for a session"""
+    collection_name = get_collection_name(session_id)
+    
+    # Check if collection exists
+    client = get_qdrant_client()
+    collections = client.get_collections().collections
+    collection_names = [col.name for col in collections]
+    
+    if collection_name not in collection_names:
+        raise HTTPException(
+            status_code=400,
+            detail="No documents uploaded for this session. Please upload PDFs or URLs first."
+        )
+    
+    vectorstore = QdrantVectorStore(
+        client=client,
+        collection_name=collection_name,
+        embedding=get_embeddings()
+    )
+    
+    session_last_activity[session_id] = datetime.now()
+    
+    return vectorstore
 
 def extract_citations(source_documents: List[Document]) -> List[dict]:
     """Extract citation information from source documents"""
@@ -125,12 +220,35 @@ def extract_citations(source_documents: List[Document]) -> List[dict]:
     
     return citations
 
+def cleanup_old_sessions():
+    """Remove chat history for sessions inactive for > 2 hours"""
+    cutoff = datetime.now() - timedelta(hours=2)
+    to_delete = [
+        sid for sid, last_time in session_last_activity.items()
+        if last_time < cutoff
+    ]
+    for sid in to_delete:
+        if sid in session_stores:
+            del session_stores[sid]
+        del session_last_activity[sid]
+
+@app.middleware("http")
+async def cleanup_middleware(request, call_next):
+    """Cleanup old sessions on each request"""
+    cleanup_old_sessions()
+    response = await call_next(request)
+    return response
+
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
-        "message": "RAG API is running",
+        "message": "RAG API v2.0 is running (Qdrant Cloud + HuggingFace Embeddings)",
         "status": "healthy",
+        "storage": "Qdrant Cloud (external)",
+        "embeddings": "HuggingFace (local)",
+        "embedding_model": "sentence-transformers/all-MiniLM-L12-v2",
+        "embedding_dimensions": 384,
         "endpoints": {
             "health": "/health",
             "upload_pdfs": "/upload-pdfs",
@@ -144,12 +262,24 @@ async def root():
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "RAG API",
-        "active_sessions": len(session_stores),
-        "active_vectorstores": len(vectorstores)
-    }
+    try:
+        client = get_qdrant_client()
+        collections = client.get_collections()
+        
+        return {
+            "status": "healthy",
+            "service": "RAG API v2.0",
+            "active_chat_sessions": len(session_stores),
+            "qdrant_collections": len(collections.collections),
+            "storage": "Qdrant Cloud",
+            "embeddings": "HuggingFace Local",
+            "embedding_model": "sentence-transformers/all-MiniLM-L12-v2"
+        }
+    except Exception as e:
+        return {
+            "status": "degraded",
+            "error": str(e)
+        }
 
 @app.post("/upload-pdfs")
 async def upload_pdfs(
@@ -164,18 +294,22 @@ async def upload_pdfs(
             if not file.filename.endswith('.pdf'):
                 raise HTTPException(status_code=400, detail="Only PDF files are allowed")
             
+            # Create temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
                 shutil.copyfileobj(file.file, tmp_file)
                 tmp_path = tmp_file.name
             
-            loader = PyPDFLoader(tmp_path)
-            docs = loader.load()
-            
-            for doc in docs:
-                doc.metadata['source'] = file.filename
-            
-            documents.extend(docs)
-            os.unlink(tmp_path)
+            try:
+                loader = PyPDFLoader(tmp_path)
+                docs = loader.load()
+                
+                for doc in docs:
+                    doc.metadata['source'] = file.filename
+                
+                documents.extend(docs)
+            finally:
+                # Clean up temp file
+                os.unlink(tmp_path)
         
         if not documents:
             raise HTTPException(
@@ -189,7 +323,8 @@ async def upload_pdfs(
             "status": "success",
             "message": f"Processed {len(files)} PDF files",
             "chunks": chunks,
-            "documents": len(documents)
+            "documents": len(documents),
+            "session_id": session_id
         }
     
     except HTTPException:
@@ -236,7 +371,8 @@ async def upload_urls(request: URLRequest):
             "status": "success",
             "message": f"Processed {len(successful_urls)} URLs successfully",
             "chunks": chunks,
-            "successful_urls": successful_urls
+            "successful_urls": successful_urls,
+            "session_id": request.session_id
         }
         
         if failed_urls:
@@ -255,18 +391,19 @@ async def query_documents(request: QueryRequest):
     try:
         session_id = request.session_id
         
-        if session_id not in vectorstores:
-            raise HTTPException(
-                status_code=400, 
-                detail="No documents uploaded for this session. Please upload PDFs or URLs first."
-            )
+        # Get vectorstore from Qdrant
+        vectorstore = get_vectorstore(session_id)
         
-        llm = ChatGroq(groq_api_key=request.groq_api_key, model_name="llama-3.3-70b-versatile")
+        llm = ChatGroq(
+            groq_api_key=request.groq_api_key, 
+            model_name="llama-3.3-70b-versatile"
+        )
         
-        retriever = vectorstores[session_id].as_retriever(
+        retriever = vectorstore.as_retriever(
             search_kwargs={"k": 4}
         )
         
+        # Contextualize question based on chat history
         contextualize_q_system_prompt = (
             "Given a chat history and the latest user question "
             "which might reference context in the chat history, "
@@ -284,6 +421,7 @@ async def query_documents(request: QueryRequest):
             llm, retriever, contextualize_q_prompt
         )
         
+        # Answer question
         system_prompt = (
             "You are an assistant for question-answering tasks. "
             "Use the following pieces of retrieved context to answer "
@@ -338,19 +476,34 @@ async def get_chat_history(session_id: str):
             }
             for msg in history.messages
         ]
-        return {"messages": messages}
+        return {"messages": messages, "session_id": session_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
-    """Clear a session's data"""
+    """Clear a session's data (chat history and vector store)"""
     try:
+        # Clear chat history
         if session_id in session_stores:
             del session_stores[session_id]
-        if session_id in vectorstores:
-            del vectorstores[session_id]
-        return {"status": "success", "message": "Session cleared"}
+        if session_id in session_last_activity:
+            del session_last_activity[session_id]
+        
+        # Delete Qdrant collection
+        try:
+            client = get_qdrant_client()
+            collection_name = get_collection_name(session_id)
+            client.delete_collection(collection_name)
+        except Exception as e:
+            # Collection might not exist, that's okay
+            pass
+        
+        return {
+            "status": "success", 
+            "message": "Session cleared (chat history and documents)",
+            "session_id": session_id
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -358,4 +511,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
